@@ -3,7 +3,7 @@
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { readFileSync, writeFileSync, existsSync, unlinkSync, mkdirSync } from 'fs';
-import { spawn, exec } from 'child_process';
+import { spawn, exec, execSync } from 'child_process';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -28,27 +28,41 @@ function ensureConfigDir() {
 }
 
 /**
- * Check if the service is running by reading PID file and verifying process
+ * Check if the service is running by reading PID file and verifying process.
+ * Falls back to probing the HTTP port when the PID file is missing or stale,
+ * e.g. when the server was started by another user or externally (the PID
+ * file lives in that user's home directory).
  */
 function isServiceRunning() {
-  if (!existsSync(PID_FILE)) {
-    return false;
-  }
-
-  try {
-    const pidStr = readFileSync(PID_FILE, 'utf-8');
-    const pid = parseInt(pidStr, 10);
-    if (isNaN(pid)) {
+  if (existsSync(PID_FILE)) {
+    try {
+      const pidStr = readFileSync(PID_FILE, 'utf-8');
+      const pid = parseInt(pidStr, 10);
+      if (!isNaN(pid)) {
+        // Check if process is running (signal 0 doesn't kill, just checks)
+        process.kill(pid, 0);
+        return true;
+      }
+    } catch (e) {
+      if (e.code === 'EPERM') {
+        // Process exists but is owned by another user
+        return true;
+      }
+      // Stale or unreadable PID entry — remove it
       cleanupPidFile();
-      return false;
     }
+  }
+  return isPortResponding();
+}
 
-    // Check if process is running (signal 0 doesn't kill, just checks)
-    process.kill(pid, 0);
+/**
+ * Probe the local HTTP endpoint to detect an externally-started server
+ */
+function isPortResponding() {
+  try {
+    execSync(`curl -sf -m 2 -o /dev/null http://localhost:${getPort()}/`, { stdio: 'ignore' });
     return true;
   } catch (e) {
-    // Process doesn't exist
-    cleanupPidFile();
     return false;
   }
 }
@@ -234,6 +248,13 @@ function stopServer() {
   }
 
   const pid = getServicePid();
+  if (pid === null) {
+    console.log('');
+    console.log('🌑 Proxy is running but was not started by acc (no PID file).');
+    console.log('   Stop it manually, e.g.: sudo pkill -f antigravity-claude-proxy');
+    console.log('');
+    return;
+  }
   try {
     process.kill(pid, 'SIGTERM');
     cleanupPidFile();
@@ -259,6 +280,12 @@ async function restartServer() {
   // Stop if running
   if (isServiceRunning()) {
     const pid = getServicePid();
+    if (pid === null) {
+      console.log('   └─ Running instance was not started by acc (no PID file).');
+      console.log('     Stop it manually, then run acc start again.');
+      console.log('');
+      return;
+    }
     try {
       process.kill(pid, 'SIGTERM');
       cleanupPidFile();
@@ -294,7 +321,7 @@ function showStatus() {
     console.log('  ⚡ Proxy is active');
     console.log('');
     console.log('  DETAILS');
-    console.log(`  ├─ PID: ${pid}`);
+    console.log(`  ├─ PID: ${pid ?? 'external (not started by acc)'}`);
     console.log(`  ├─ Port: ${port}`);
     console.log(`  ├─ API: http://localhost:${port}`);
     console.log(`  └─ Dashboard: http://localhost:${port}/`);
