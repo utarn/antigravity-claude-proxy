@@ -24,6 +24,17 @@ import { deriveSessionId } from './session-manager.js';
 // Defaults cover agents commonly used with this proxy; extend or override with
 // the ANTIGRAVITY_SCRUB_IDENTITY env var, formatted as a comma-separated list of
 // "Term=>Replacement" pairs, e.g. "Nous Research=>the team,Hermes=>the assistant".
+//
+// Claude Code and Anthropic are listed explicitly: issue #375 identified
+// "You are Claude Code, Anthropic's official CLI for Claude." as a 429 trigger
+// alongside the billing header, but the merged fix (2f6afae) only stripped the
+// header and left both names in place.
+//
+// Matching is case-sensitive on purpose, so lower-case header names
+// (x-anthropic-beta, anthropic-version) and file names (CLAUDE.md) are left
+// alone. The bare word "Claude" is deliberately NOT scrubbed: it is legitimate
+// in model self-descriptions, and requests succeed with it present once the two
+// names above are neutralized.
 const DEFAULT_IDENTITY_SCRUB = [
     // Claude Code / Anthropic — Claude Code sends system prompts identifying as
     // "Claude, made by Anthropic" which trips cloudcode-pa's third-party AI filter.
@@ -34,7 +45,9 @@ const DEFAULT_IDENTITY_SCRUB = [
     // Hermes / Nous Research (original scrub targets from #364)
     ['Nous Research', 'the assistant team'],
     ['Hermes Agent', 'the assistant'],
-    ['Hermes', 'the assistant']
+    ['Hermes', 'the assistant'],
+    ['Claude Code', 'the assistant'],
+    ['Anthropic', 'the vendor']
 ];
 
 function parseIdentityScrubEnv(raw) {
@@ -49,10 +62,16 @@ function parseIdentityScrubEnv(raw) {
         .filter((rule) => rule && rule[0].length > 0);
 }
 
+function escapeRegExp(text) {
+    return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// Terms match as whole words only, so identifiers that merely contain a term
+// (convertAnthropicToGoogle, AnthropicRequest, HermesHandler) are left alone.
 const IDENTITY_SCRUB_RULES = [
     ...DEFAULT_IDENTITY_SCRUB,
     ...parseIdentityScrubEnv(process.env.ANTIGRAVITY_SCRUB_IDENTITY)
-];
+].map(([term, replacement]) => [new RegExp(`\\b${escapeRegExp(term)}\\b`, 'g'), replacement]);
 
 function scrubClientIdentity(text) {
     if (typeof text !== 'string') return text;
@@ -61,8 +80,8 @@ function scrubClientIdentity(text) {
     out = out
         .replace(/^x-anthropic-billing-header:[^\n]*\n?/gim, '')
         .replace(/^x-anthropic-[a-z0-9_-]+:[^\n]*\n?/gim, '');
-    for (const [term, replacement] of IDENTITY_SCRUB_RULES) {
-        out = out.split(term).join(replacement);
+    for (const [pattern, replacement] of IDENTITY_SCRUB_RULES) {
+        out = out.replace(pattern, () => replacement);
     }
     return out.trim();
 }
