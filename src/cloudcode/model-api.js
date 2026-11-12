@@ -63,29 +63,76 @@ function isDisabledPlaceholder(modelId) {
 }
 
 /**
- * List available models in Anthropic API format
- * Fetches models dynamically from the Cloud Code API
+ * Normalize a token / list of tokens into `{ token, projectId }` sources.
+ * Accepts a single token string, an array of token strings, or an array of
+ * `{ token, projectId }` objects.
  *
- * @param {string} token - OAuth access token
+ * @param {string|string[]|Array<{token: string, projectId?: string|null}>} input
+ * @returns {Array<{token: string, projectId: string|null}>}
+ */
+function normalizeModelSources(input) {
+    const items = Array.isArray(input) ? input : [input];
+    return items
+        .map(item => (typeof item === 'string'
+            ? { token: item, projectId: null }
+            : { token: item?.token, projectId: item?.projectId || null }))
+        .filter(item => item.token);
+}
+
+/**
+ * List available models in Anthropic API format.
+ *
+ * The listing is the union of every account in the pool, not just whichever
+ * single account the selection strategy happens to pick: Cloud Code returns a
+ * per-account catalogue, and a legacy/limited account must not hide a model
+ * that another account in the pool can serve.
+ *
+ * @param {string|string[]|Array<{token: string, projectId?: string|null}>} input - One or more account tokens
  * @returns {Promise<{object: string, data: Array<{id: string, object: string, created: number, owned_by: string, description: string}>}>} List of available models
  */
-export async function listModels(token) {
-    const data = await fetchAvailableModels(token);
-    if (!data || !data.models) {
-        return { object: 'list', data: [] };
+export async function listModels(input) {
+    const sources = normalizeModelSources(input);
+    const results = await Promise.allSettled(
+        sources.map(({ token, projectId }) => fetchAvailableModels(token, projectId))
+    );
+
+    const merged = new Map();
+    const validIds = new Set();
+    let firstError = null;
+
+    for (const result of results) {
+        if (result.status === 'rejected') {
+            firstError ??= result.reason;
+            continue;
+        }
+
+        const data = result.value;
+        if (!data || !data.models) continue;
+
+        recordModels(data);
+        for (const [modelId, modelData] of Object.entries(data.models)) {
+            if (!isSupportedModel(modelId)) continue;
+            validIds.add(modelId);
+            if (!merged.has(modelId)) merged.set(modelId, modelData);
+        }
     }
 
-    recordModels(data);
-    const supportedEntries = Object.entries(data.models).filter(([modelId]) => isSupportedModel(modelId));
+    // Every source failed: surface the error instead of silently reporting an
+    // empty catalogue (matches the single-token behaviour).
+    if (sources.length > 0 && merged.size === 0 && firstError) {
+        throw firstError;
+    }
 
-    // Warm the model validation cache with every supported id, unfiltered -
-    // isValidModel() (the actual request-time gate) must keep accepting an
-    // id a client already has configured even if it's hidden from the
-    // listing below.
-    modelCache.validModels = new Set(supportedEntries.map(([modelId]) => modelId));
-    modelCache.lastFetched = Date.now();
+    // Warm the model validation cache with the union of every supported id,
+    // unfiltered - isValidModel() (the actual request-time gate) must keep
+    // accepting an id a client already has configured even if it's hidden
+    // from the listing below.
+    if (validIds.size > 0) {
+        modelCache.validModels = validIds;
+        modelCache.lastFetched = Date.now();
+    }
 
-    const modelList = supportedEntries
+    const modelList = [...merged.entries()]
         .filter(([modelId]) => !isOldGemini(modelId) && !isDisabledPlaceholder(modelId))
         .map(([modelId, modelData]) => ({
             id: modelId,
@@ -318,12 +365,12 @@ export async function getSubscriptionTier(token) {
 }
 
 /**
- * Populate the model validation cache
- * @param {string} token - OAuth access token
- * @param {string} [projectId] - Optional project ID
+ * Populate the model validation cache from one or more account sources.
+ * @param {string|string[]|Array<{token: string, projectId?: string|null}>} input - One or more account tokens
+ * @param {string} [projectId] - Optional project ID (single-token form only)
  * @returns {Promise<void>}
  */
-async function populateModelCache(token, projectId = null) {
+async function populateModelCache(input, projectId = null) {
     const now = Date.now();
 
     // Check if cache is fresh
@@ -340,13 +387,35 @@ async function populateModelCache(token, projectId = null) {
     // Start fetch
     modelCache.fetchPromise = (async () => {
         try {
-            const data = await fetchAvailableModels(token, projectId);
-            if (data && data.models) {
+            const sources = normalizeModelSources(input);
+            if (!Array.isArray(input) && projectId) {
+                sources[0].projectId = projectId;
+            }
+
+            const results = await Promise.allSettled(
+                sources.map(({ token, projectId: sourceProjectId }) => fetchAvailableModels(token, sourceProjectId))
+            );
+
+            const validIds = new Set();
+            for (const result of results) {
+                if (result.status !== 'fulfilled') {
+                    logger.debug(`[CloudCode] Model cache source failed: ${result.reason?.message}`);
+                    continue;
+                }
+                const data = result.value;
+                if (!data || !data.models) continue;
                 recordModels(data);
-                const validIds = Object.keys(data.models).filter(modelId => isSupportedModel(modelId));
-                modelCache.validModels = new Set(validIds);
+                // Union across the pool so a model available on any account
+                // stays valid at request time.
+                for (const modelId of Object.keys(data.models)) {
+                    if (isSupportedModel(modelId)) validIds.add(modelId);
+                }
+            }
+
+            if (validIds.size > 0) {
+                modelCache.validModels = validIds;
                 modelCache.lastFetched = Date.now();
-                logger.debug(`[CloudCode] Model cache populated with ${validIds.length} models`);
+                logger.debug(`[CloudCode] Model cache populated with ${validIds.size} models`);
             }
         } catch (error) {
             logger.warn(`[CloudCode] Failed to populate model cache: ${error.message}`);
@@ -363,14 +432,14 @@ async function populateModelCache(token, projectId = null) {
  * Check if a model ID is valid (exists in the available models list)
  * Uses a cached model list with TTL-based refresh
  * @param {string} modelId - Model ID to validate
- * @param {string} token - OAuth access token for cache population
- * @param {string} [projectId] - Optional project ID
+ * @param {string|string[]|Array<{token: string, projectId?: string|null}>} input - Account token(s) for cache population
+ * @param {string} [projectId] - Optional project ID (single-token form only)
  * @returns {Promise<boolean>} True if model is valid
  */
-export async function isValidModel(modelId, token, projectId = null) {
+export async function isValidModel(modelId, input, projectId = null) {
     try {
         // Populate cache if needed
-        await populateModelCache(token, projectId);
+        await populateModelCache(input, projectId);
 
         // If cache is populated, validate against it
         if (modelCache.validModels.size > 0) {

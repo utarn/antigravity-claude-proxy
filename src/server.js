@@ -657,13 +657,35 @@ app.post('/refresh-token', async (req, res) => {
 });
 
 /**
+ * Collect model sources for every enabled, non-invalid account.
+ * Cloud Code returns a per-account model catalogue, so endpoints that answer
+ * "what can this proxy serve?" must look at the whole pool - otherwise a
+ * legacy/limited account hides models other accounts can actually use.
+ *
+ * @returns {Promise<Array<{token: string, projectId: string|null}>>}
+ */
+async function getAccountModelSources() {
+    const accounts = accountManager.getAllAccounts()
+        .filter(account => account.enabled !== false && !account.isInvalid);
+
+    const resolved = await Promise.allSettled(accounts.map(async account => ({
+        token: await accountManager.getTokenForAccount(account),
+        projectId: account.subscription?.projectId || null
+    })));
+
+    return resolved
+        .filter(result => result.status === 'fulfilled')
+        .map(result => result.value);
+}
+
+/**
  * List models endpoint (OpenAI-compatible format)
  */
 app.get('/v1/models', async (req, res) => {
     try {
         await ensureInitialized();
-        const { account } = accountManager.selectAccount();
-        if (!account) {
+        const sources = await getAccountModelSources();
+        if (sources.length === 0) {
             return res.status(503).json({
                 type: 'error',
                 error: {
@@ -672,8 +694,7 @@ app.get('/v1/models', async (req, res) => {
                 }
             });
         }
-        const token = await accountManager.getTokenForAccount(account);
-        const models = await listModels(token);
+        const models = await listModels(sources);
         res.json(models);
     } catch (error) {
         logger.error('[API] Error listing models:', error);
@@ -749,11 +770,9 @@ app.post('/v1/messages', async (req, res) => {
             // Valid virtual model
         } else {
             // Validate model ID before processing
-            const { account: validationAccount } = accountManager.selectAccount();
-            if (validationAccount) {
-                const token = await accountManager.getTokenForAccount(validationAccount);
-                const projectId = validationAccount.subscription?.projectId || null;
-                const valid = await isValidModel(modelId, token, projectId);
+            const validationSources = await getAccountModelSources();
+            if (validationSources.length > 0) {
+                const valid = await isValidModel(modelId, validationSources);
 
                 if (!valid) {
                     throw new Error(`invalid_request_error: Invalid model: ${modelId}. Use /v1/models to see available models.`);
